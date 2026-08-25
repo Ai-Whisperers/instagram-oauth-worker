@@ -1,0 +1,13 @@
+name = "instagram-oauth"
+main = "src/index.js"
+compatibility_date = "2024-09-01"
+
+[vars]
+# All secrets are set via `wrangler secret put`, NOT here.
+
+[[kv_namespaces]]
+binding = "OAUTH_STATE"
+id = "REPLACE_WITH_KV_NS_ID"
+
+[observability]
+enabled = true
