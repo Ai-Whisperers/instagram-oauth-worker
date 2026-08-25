@@ -1,60 +1,26 @@
 /**
- * instagram-oauth — Cloudflare Worker implementing the OAuth 2.0 authorization
- * code flow for the Hermes Instagram integration (Instagram Login, NOT Facebook
- * Login — see references/auth-flow-choice.md).
+ * instagram-oauth — CF Worker. Hermes Instagram MCP integration.
+ *
+ * OAuth 2.0 authorization code flow (Instagram Login, NOT Facebook Login).
+ * Two-token dance: short-lived (1h) → long-lived (60d).
+ *
+ * Writes the access token to CF KV namespace `OAUTH_STATE` (key prefix `instagram:`).
+ * A separate cron in the hermes container (kv_bws_sync.py) bridges CF KV → BWS via the SDK.
  *
  * Endpoints:
- *   GET  /auth/ig/start         → 302 to Instagram authorize URL (with state cookie)
- *   GET  /auth/ig/callback      → exchanges code for token, writes long-lived token to BWS
- *   POST /auth/ig/refresh       → exchanges refresh_token for a new long-lived token
- *   GET  /healthz               → liveness probe
+ *   GET  /auth/ig/start         → 302 to Instagram authorize URL
+ *   GET  /auth/ig/callback      → exchanges code → short → long token → stores to CF KV
+ *   POST /auth/ig/refresh       → exchanges long-lived for new long-lived (60d more)
+ *   GET  /healthz                 → liveness probe
  *
- * Two-token dance (Meta-specific):
- *   Step 1: short-lived token from /oauth/access_token (1h TTL)
- *   Step 2: long-lived token from /access_token (60d TTL, requires public_content +
- *           instagram_business_basic permissions AND a Meta Business account linked
- *           to a Facebook Page in the same app)
- *
- * For long-lived refresh (additional 60d):
- *   POST /refresh_access_token with grant_type=ig_refresh_token
- *
- * Secrets required (set with `wrangler secret put`):
+ * Secrets (set via `wrangler secret put`):
  *   META_APP_ID
  *   META_APP_SECRET
- *   META_REDIRECT_URI              e.g. https://auth.hermes.paragu-ai.com/auth/ig/callback
- *   META_SCOPES                    space-separated, default "instagram_business_basic instagram_business_content_publish instagram_business_manage_comments instagram_business_manage_messages"
- *   BWS_ACCESS_TOKEN               Bitwarden Secrets Manager service-account token
- *   BWS_BASE_URL                   default https://vault.bitwarden.com/api
- *   BWS_SECRET_ID_ACCESS_TOKEN     UUID of the META_ACCESS_TOKEN secret (the short-lived one we overwrite)
- *   BWS_SECRET_ID_LONG_LIVED_TOKEN UUID of a NEW secret META_IG_LONG_LIVED_TOKEN (60d)
- *   BWS_SECRET_ID_ISSUED_AT        UUID of META_TOKEN_ISSUED_AT
- *   BWS_SECRET_ID_SCOPES           UUID of META_TOKEN_SCOPES
- *   BWS_SECRET_ID_REFRESH_TOKEN    UUID of a NEW secret META_IG_REFRESH_TOKEN (optional, comes from refresh)
- *
- * Trademark note: this Worker is `instagram-oauth` per the org banlist
- * carve-outs. The internal class names / API endpoints use the upstream
- * "instagram_*" naming because that's what Meta calls them — those are
- * internal references only and not exposed in any user-facing string.
+ *   META_REDIRECT_URI
+ *   META_SCOPES       (space-separated)
  */
 
-// ----- BWS client (minimal REST wrapper) -----
-async function bwsPutSecret(baseUrl, bwsToken, secretId, value) {
-  const r = await fetch(`${baseUrl}/secrets/${secretId}`, {
-    method: "PUT",
-    headers: {
-      "Authorization": `Bearer ${bwsToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ value }),
-  });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`BWS PUT failed ${r.status}: ${t.slice(0, 200)}`);
-  }
-  return await r.json();
-}
-
-// ----- State store (10-min TTL via KV) -----
+// ----- CSRF state (CF KV) -----
 async function saveState(kv, state) {
   await kv.put("state:" + state, "1", { expirationTtl: 600 });
 }
@@ -66,6 +32,13 @@ async function consumeState(kv, state) {
   return true;
 }
 
+// ----- Writeback helper (CF KV) -----
+async function kvPut(kv, key, value, ttlSeconds) {
+  const opts = ttlSeconds ? { expirationTtl: ttlSeconds } : undefined;
+  await kv.put(key, value, opts);
+}
+
+// ----- HTTP helpers -----
 function htmlResponse(status, body) {
   return new Response(body, {
     status,
@@ -75,7 +48,6 @@ function htmlResponse(status, body) {
 function redirect(location) {
   return new Response(null, { status: 302, headers: { Location: location } });
 }
-
 function randomState() {
   const bytes = new Uint8Array(24);
   crypto.getRandomValues(bytes);
@@ -84,7 +56,6 @@ function randomState() {
 
 // ----- Meta token helpers -----
 async function exchangeCodeForShortLivedToken(env, code) {
-  // Step 1: short-lived (1h) token via Instagram Login
   const body = new URLSearchParams({
     client_id: env.META_APP_ID,
     client_secret: env.META_APP_SECRET,
@@ -105,7 +76,6 @@ async function exchangeCodeForShortLivedToken(env, code) {
 }
 
 async function exchangeForLongLivedToken(env, shortToken) {
-  // Step 2: short → long (60d). Requires app secret in URL.
   const params = new URLSearchParams({
     grant_type: "ig_exchange_token",
     client_secret: env.META_APP_SECRET,
@@ -120,7 +90,6 @@ async function exchangeForLongLivedToken(env, shortToken) {
 }
 
 async function refreshLongLivedToken(env, longLivedToken) {
-  // Step 3: refresh long → new long (60d more, one-shot per token).
   const params = new URLSearchParams({
     grant_type: "ig_refresh_token",
     access_token: longLivedToken,
@@ -182,25 +151,18 @@ async function handleCallback(env, request) {
   const issuedAt = new Date().toISOString();
   const expiresInDays = longToken.expires_in ? Math.round(longToken.expires_in / 86400) : 60;
 
-  // Write all BWS secrets
-  const baseUrl = env.BWS_BASE_URL || "https://vault.bitwarden.com/api";
-  const writes = [
-    // Overwrite the META_ACCESS_TOKEN with the long-lived one (same slot, what MCP reads)
-    bwsPutSecret(baseUrl, env.BWS_ACCESS_TOKEN, env.BWS_SECRET_ID_ACCESS_TOKEN, longToken.access_token),
-    // Mirror the long-lived into its own slot for clarity
-    bwsPutSecret(baseUrl, env.BWS_ACCESS_TOKEN, env.BWS_SECRET_ID_LONG_LIVED_TOKEN, longToken.access_token),
-    bwsPutSecret(baseUrl, env.BWS_ACCESS_TOKEN, env.BWS_SECRET_ID_ISSUED_AT, issuedAt),
-    bwsPutSecret(baseUrl, env.BWS_ACCESS_TOKEN, env.BWS_SECRET_ID_SCOPES, env.META_SCOPES || ""),
-  ];
-  if (longToken.user_id && env.BWS_SECRET_ID_USER_ID) {
-    writes.push(bwsPutSecret(baseUrl, env.BWS_ACCESS_TOKEN, env.BWS_SECRET_ID_USER_ID, String(longToken.user_id)));
-  }
-
-  let writeErrors = [];
-  await Promise.all(writes.map((p) => p.catch((e) => writeErrors.push(String(e).slice(0, 200)))));
-
-  if (writeErrors.length === writes.length) {
-    return htmlResponse(502, `<h1>Instagram authorized but BWS writes failed</h1><pre>${writeErrors.join("\n")}</pre>`);
+  // Write all token fields to CF KV (key prefix "instagram:") for the kv-bws-sync cron to pick up.
+  // KV entries use 90-day TTL — covers the 60-day token lifetime with buffer.
+  try {
+    await kvPut(env.OAUTH_STATE, "instagram:access_token", longToken.access_token, 90 * 86400);
+    await kvPut(env.OAUTH_STATE, "instagram:long_lived_token", longToken.access_token, 90 * 86400);
+    await kvPut(env.OAUTH_STATE, "instagram:issued_at", issuedAt, 90 * 86400);
+    await kvPut(env.OAUTH_STATE, "instagram:scopes", env.META_SCOPES || "", 90 * 86400);
+    if (longToken.user_id) {
+      await kvPut(env.OAUTH_STATE, "instagram:user_id", String(longToken.user_id), 90 * 86400);
+    }
+  } catch (e) {
+    return htmlResponse(502, `<h1>CF KV writeback failed</h1><pre>${String(e).slice(0, 500)}</pre>`);
   }
 
   return htmlResponse(
@@ -210,8 +172,8 @@ async function handleCallback(env, request) {
      <p>Long-lived token expires in <b>${expiresInDays} days</b>. Issued at ${issuedAt}.</p>
      <p>User ID: ${longToken.user_id ?? "(unknown)"}</p>
      <p>Scopes: <code>${env.META_SCOPES || "(unknown)"}</code></p>
-     ${writeErrors.length ? `<p style="color:#c80">⚠️ ${writeErrors.length} of ${writes.length} secret writes failed — check logs.</p>` : ""}
-     <p>You can close this tab. Restart Hermes to pick up the new token.</p>
+     <p>Token written to CF KV (kv-bws-sync will move it to BWS within 5 min).</p>
+     <p>You can close this tab.</p>
      </body></html>`
   );
 }
@@ -235,12 +197,13 @@ async function handleRefresh(env, request) {
   }
 
   const issuedAt = new Date().toISOString();
-  const baseUrl = env.BWS_BASE_URL || "https://vault.bitwarden.com/api";
-  await Promise.all([
-    bwsPutSecret(baseUrl, env.BWS_ACCESS_TOKEN, env.BWS_SECRET_ID_ACCESS_TOKEN, refreshed.access_token),
-    bwsPutSecret(baseUrl, env.BWS_ACCESS_TOKEN, env.BWS_SECRET_ID_LONG_LIVED_TOKEN, refreshed.access_token),
-    bwsPutSecret(baseUrl, env.BWS_ACCESS_TOKEN, env.BWS_SECRET_ID_ISSUED_AT, issuedAt),
-  ]);
+  try {
+    await kvPut(env.OAUTH_STATE, "instagram:access_token", refreshed.access_token, 90 * 86400);
+    await kvPut(env.OAUTH_STATE, "instagram:long_lived_token", refreshed.access_token, 90 * 86400);
+    await kvPut(env.OAUTH_STATE, "instagram:issued_at", issuedAt, 90 * 86400);
+  } catch (e) {
+    return new Response("CF KV writeback failed: " + String(e).slice(0, 300), { status: 502 });
+  }
 
   return Response.json({
     ok: true,

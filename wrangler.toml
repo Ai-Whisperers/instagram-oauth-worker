@@ -7,7 +7,7 @@ compatibility_date = "2024-09-01"
 
 [[kv_namespaces]]
 binding = "OAUTH_STATE"
-id = "REPLACE_WITH_KV_NS_ID"
+id = "004ea62ebed54ee6abc10aeb320d32aa"
 
 [observability]
 enabled = true
